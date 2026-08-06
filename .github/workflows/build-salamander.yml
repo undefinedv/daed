@@ -1,0 +1,211 @@
+name: Build daed (arm64 + salamander)
+
+# Manually-triggered build that produces a FULLY-STATIC linux/arm64 `daed`
+# binary with hysteria2 salamander obfuscation patched into the outbound dialer.
+#
+# Why fully-static: the target router runs OpenWrt (musl libc). A dynamically
+# linked glibc binary will NOT load there. A fully-static binary has no runtime
+# libc dependency at all, so it runs on musl and glibc alike — this is exactly
+# how the currently-working /usr/bin/daed was built (verified: `file` reports
+# "statically linked"). CGO_ENABLED=0 guarantees a static pure-Go binary and
+# lets us cross-compile arm64 from a cheap x86 runner with no cross toolchain.
+#
+# Output: artifact `daed-linux-arm64-salamander`. Download, scp to the router,
+# replace /usr/bin/daed, restart the service.
+
+on:
+  # Auto-run when this branch is pushed (no API token needed to trigger).
+  push:
+    branches: [salamander]
+  workflow_dispatch:
+    inputs:
+      outbound_ref:
+        description: "olicesx/outbound commit to patch against (must match wing/go.mod)"
+        default: "8de5a31bdbe1"
+      version:
+        description: "VERSION string stamped into the binary"
+        default: "salamander"
+      upx:
+        description: "Compress the binary with UPX (true/false)"
+        default: "true"
+
+permissions:
+  contents: write # needed to publish the binary as a Release asset
+
+jobs:
+  build:
+    runs-on: ubuntu-latest # x86; amd64 builds natively, arm64 cross-compiles (CGO off)
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [arm64, amd64] # build both; pick the one matching each device
+    env:
+      GOOS: linux
+      GOARCH: ${{ matrix.goarch }}
+      CGO_ENABLED: "0" # -> fully static, musl-compatible, no cross C toolchain
+      GOFLAGS: "-mod=mod" # allow go to reconcile go.mod/go.sum after bumping dae-core
+    steps:
+      - name: Checkout daed (+ wing, dae-core submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          check-latest: true
+
+      # Match upstream daed CI: action-setup reads the pnpm version from the
+      # package.json "packageManager" field, so do NOT pass a version input
+      # (doing so conflicts with packageManager and fails the step).
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6.0.9
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: latest
+
+      - name: Install eBPF codegen deps (host-side, arch-independent)
+        run: sudo apt-get update && sudo apt-get install -y clang llvm libelf-dev make
+
+      - name: Pin dae-core to ab16181 (v0.2.4 = running binary; supports disable_thp)
+        run: |
+          set -euxo pipefail
+          # dae-wing@dc50308 pins dae-core at v0.2.0, which does NOT know the
+          # `disable_thp` global config key that the router's stored config uses.
+          # The currently-running binary was built with dae-core ab16181 (v0.2.4),
+          # which supports it. Match that exactly. This governs BOTH the eBPF
+          # build (Makefile compiles from ./dae-core) and the Go code
+          # (go.mod: replace dae => ./dae-core), keeping them consistent.
+          # dae-core must come from the olicesx fork: commit ab16181 (the core
+          # of the running binary, with disable_thp) lives there, NOT on
+          # daeuniverse/dae. Module path is still github.com/daeuniverse/dae, so
+          # the `replace dae => ./dae-core` in wing/go.mod keeps working.
+          rm -rf wing/dae-core
+          git clone https://github.com/olicesx/dae.git wing/dae-core
+          cd wing/dae-core
+          git checkout ab1618181a1c
+          git submodule update --init --recursive 2>/dev/null || true
+          echo "dae-core now at: $(git rev-parse --short HEAD)"
+          grep -n "disable_thp" config/config.go || { echo "disable_thp not found!"; exit 1; }
+
+      - name: Patch outbound with salamander
+        run: |
+          set -euxo pipefail
+          git clone https://github.com/olicesx/outbound.git /tmp/outbound
+          cd /tmp/outbound
+          git checkout "${{ github.event.inputs.outbound_ref || '8de5a31bdbe1' }}"
+          git apply "$GITHUB_WORKSPACE/patches/salamander-outbound-8de5a31.patch"
+          # Redirect wing's module graph to the patched local outbound. Overrides
+          # the existing `replace ... => olicesx/outbound` and applies to the
+          # whole graph (including dae-core).
+          cd "$GITHUB_WORKSPACE/wing"
+          go mod edit -replace github.com/daeuniverse/outbound=/tmp/outbound
+
+      # Split into granular steps so the failing phase is visible from step
+      # status alone (CI logs are not readable without auth).
+      - name: "Build phase 1: eBPF + codegen (host-native)"
+        run: |
+          set -euxo pipefail
+          go version; echo "host arch: $(go env GOHOSTARCH); target: $(go env GOARCH)"
+          # Must run on the amd64 host: bpf2go / gqlgen are executed via
+          # `go run`/`go generate`. Strip cross vars so they don't cross-build.
+          cd wing && env -u GOOS -u GOARCH -u GOARM -u CC -u CGO_ENABLED make deps
+
+      - name: "Build phase 2: frontend assets"
+        env:
+          HUSKY: "0" # don't run git hooks in CI
+          NODE_OPTIONS: "--max-old-space-size=6144" # monaco/editor build is memory-hungry
+          TURBO_TELEMETRY_DISABLED: "1"
+          DO_NOT_TRACK: "1"
+        run: |
+          set -euxo pipefail
+          # Replicate `make dist` but with CI-robust flags (avoids frozen-lockfile
+          # aborts and husky prepare failures). Produces ./dist at the repo root,
+          # which phase 3 embeds via WEB_DIST=../dist.
+          pnpm install --no-frozen-lockfile
+          pnpm build
+          rm -rf dist && cp -r apps/web/dist dist
+          ls -la dist | head
+
+      - name: "Build phase 3: static bundle (${{ matrix.goarch }})"
+        run: |
+          set -euxo pipefail
+          cd wing && make OUTPUT=../daed APPNAME=daed WEB_DIST=../dist \
+            VERSION="${{ github.event.inputs.version || 'salamander' }}-$(date +%Y%m%d)" bundle
+
+      - name: Verify the binary is ${{ matrix.goarch }} AND fully static
+        run: |
+          set -euxo pipefail
+          file ./daed
+          # Fail the build if it is not statically linked (would not run on musl).
+          case "${{ matrix.goarch }}" in
+            arm64) file ./daed | grep -q "ARM aarch64" ;;
+            amd64) file ./daed | grep -q "x86-64" ;;
+          esac
+          file ./daed | grep -q "statically linked"
+          # Arch-suffixed name so the two matrix jobs don't collide.
+          cp daed "daed-linux-${{ matrix.goarch }}"
+
+      # UPX runs AFTER the static-linkage gate (which must see the raw ELF).
+      # UPX itself is amd64 and cross-compresses both target arches. daed's
+      # embedded eBPF is read from the in-memory image after the UPX loader
+      # decompresses it, so packing does not disturb eBPF loading — but this
+      # musl-static + eBPF + UPX combo is still verified on the box after deploy.
+      - name: Compress with UPX
+        if: ${{ (github.event.inputs.upx || 'true') == 'true' }}
+        run: |
+          set -euxo pipefail
+          UPX_VER=4.2.4
+          curl -fsSL -o /tmp/upx.tar.xz \
+            "https://github.com/upx/upx/releases/download/v${UPX_VER}/upx-${UPX_VER}-amd64_linux.tar.xz"
+          tar -C /tmp -xf /tmp/upx.tar.xz
+          UPX="/tmp/upx-${UPX_VER}-amd64_linux/upx"
+          "$UPX" --version | head -1
+          BIN="daed-linux-${{ matrix.goarch }}"
+          before=$(stat -c%s "$BIN")
+          "$UPX" --best --lzma --no-progress "$BIN"
+          after=$(stat -c%s "$BIN")
+          echo "UPX: $BIN  $before -> $after bytes ($(( after * 100 / before ))%)"
+          file "$BIN"
+          # Smoke test: the amd64 packed binary can run on this x86 runner
+          # (--version needs no privileges). arm64 is verified on the router.
+          if [ "${{ matrix.goarch }}" = "amd64" ]; then
+            chmod +x "$BIN"
+            "./$BIN" --version
+          fi
+
+      - name: Upload binary (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: daed-linux-${{ matrix.goarch }}-salamander
+          path: daed-linux-${{ matrix.goarch }}
+          if-no-files-found: error
+
+      - name: Publish binary as a Release asset (public, curl-able)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: salamander-latest
+          name: daed + salamander (latest)
+          body: Fully-static linux daed with hysteria2 salamander obfuscation (arm64 + amd64).
+          files: daed-linux-${{ matrix.goarch }}
+          fail_on_unmatched_files: true
+
+# ---------------------------------------------------------------------------
+# Fallback A — if the build fails because some dependency REQUIRES cgo:
+#   reproduce the current binary exactly (CGO=1, statically linked against
+#   glibc). Use a native arm64 runner and force a static external link:
+#     runs-on: ubuntu-24.04-arm
+#     env: { GOOS: linux, GOARCH: arm64, CGO_ENABLED: "1" }
+#     install: sudo apt-get install -y clang llvm libelf-dev gcc make
+#     build:   make daed GO_LDFLAGS='-s -w -extldflags "-static"' \
+#                        VERSION=salamander-$(date +%Y%m%d)
+#   (glibc static drops NSS/getaddrinfo, but dae uses its own resolver, and the
+#    running binary is built this exact way — so it is known-good on this box.)
+#
+# Fallback B — CGO=1 static cross-compile from x86 with a musl toolchain:
+#   install: sudo apt-get install -y musl-tools clang llvm libelf-dev
+#   env:     CC=aarch64-linux-musl-gcc (from the musl.cc cross toolchain)
+# ---------------------------------------------------------------------------

@@ -1,0 +1,70 @@
+name: Sync upstream (keep salamander)
+
+# Weekly (and on-demand) merge of upstream daeuniverse/daed into our `salamander`
+# branch, preserving our salamander additions, then rebuild.
+#
+# Why this is safe/low-conflict: our changes to the daed repo are PURELY
+# ADDITIVE — two files that upstream does not have:
+#   .github/workflows/build-salamander.yml
+#   patches/salamander-outbound-8de5a31.patch
+# So `git merge upstream/main` never touches upstream files and cannot conflict
+# with them. If upstream ever adds a same-named file (extremely unlikely) the
+# merge aborts and this job fails visibly instead of shipping a broken tree.
+#
+# NOTE on scope: this syncs the daed repo (frontend + wing submodule pin). The
+# salamander patch itself stays pinned to olicesx/outbound@8de5a31 and dae-core
+# ab16181 inside build-salamander.yml (known-good on the routers). If a future
+# upstream bump needs newer outbound/dae, the rebuild will FAIL the compile/
+# static gate (no broken binary is ever published) — bump the pins manually then.
+#
+# Must live on the DEFAULT branch (main): GitHub only fires `schedule` from there.
+
+on:
+  schedule:
+    - cron: "17 4 * * 1" # Mondays 04:17 UTC (off-peak minute)
+  workflow_dispatch:
+
+permissions:
+  contents: write # push the merge to `salamander`
+  actions: write # dispatch the build workflow
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout salamander (full history)
+        uses: actions/checkout@v4
+        with:
+          ref: salamander
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge upstream daeuniverse/daed into salamander
+        id: merge
+        run: |
+          set -euxo pipefail
+          git config user.name "salamander-sync[bot]"
+          git config user.email "salamander-sync@users.noreply.github.com"
+          git remote add upstream https://github.com/daeuniverse/daed.git
+          git fetch upstream
+          BEFORE=$(git rev-parse HEAD)
+          if ! git merge --no-edit upstream/main; then
+            echo "::error::merge conflict with upstream/main — resolve manually"
+            git merge --abort
+            exit 1
+          fi
+          git submodule update --init --recursive || true
+          AFTER=$(git rev-parse HEAD)
+          if [ "$BEFORE" = "$AFTER" ]; then
+            echo "already up to date with upstream; nothing to do"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git push origin salamander
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Trigger salamander rebuild
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run build-salamander.yml --ref salamander -R "${{ github.repository }}"
