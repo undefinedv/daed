@@ -1,0 +1,656 @@
+diff --git a/dialer/hysteria2/hysteria2.go b/dialer/hysteria2/hysteria2.go
+index 91049f2..f5d0d20 100644
+--- a/dialer/hysteria2/hysteria2.go
++++ b/dialer/hysteria2/hysteria2.go
+@@ -25,16 +25,18 @@ func init() {
+ }
+ 
+ type Hysteria2 struct {
+-	Name      string
+-	User      string
+-	Password  string
+-	Server    string
+-	Insecure  bool
+-	Sni       string
+-	PinSHA256 string
+-	CA        string
+-	MaxTx     uint64
+-	MaxRx     uint64
++	Name         string
++	User         string
++	Password     string
++	Server       string
++	Insecure     bool
++	Sni          string
++	PinSHA256    string
++	CA           string
++	MaxTx        uint64
++	MaxRx        uint64
++	Obfs         string // "" or "salamander"
++	ObfsPassword string
+ }
+ 
+ func NewHysteria2(option *dialer.ExtraOption, nextDialer netproxy.Dialer, link string) (netproxy.Dialer, *dialer.Property, error) {
+@@ -73,6 +75,8 @@ func (s *Hysteria2) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Diale
+ 
+ 	feature1 := &hysteria2.Feature1{
+ 		UDPHopInterval: option.UDPHopInterval,
++		ObfsType:       s.Obfs,
++		ObfsPassword:   s.ObfsPassword,
+ 	}
+ 	if s.MaxTx > 0 && s.MaxRx > 0 {
+ 		feature1.BandwidthConfig = client.BandwidthConfig{
+@@ -148,12 +152,26 @@ func loadCustomRootCAs(caPath string) (*x509.CertPool, error) {
+ 
+ // ref: https://v2.hysteria.network/zh/docs/developers/URI-Scheme/
+ func ParseHysteria2URL(link string) (*Hysteria2, error) {
+-	// TODO: support salamander obfuscation
+ 	u, err := url.Parse(link)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	q := u.Query()
++	// Salamander obfuscation. Uses the standard URI-scheme parameters
++	// (obfs=salamander & obfs-password=...), consistent with the common
++	// subscription format shared by other clients.
++	obfsType := q.Get("obfs")
++	obfsPassword := q.Get("obfs-password")
++	switch obfsType {
++	case "", "plain":
++		obfsType = ""
++	case "salamander":
++		if obfsPassword == "" {
++			return nil, fmt.Errorf("%w: obfs=salamander requires obfs-password", dialer.InvalidParameterErr)
++		}
++	default:
++		return nil, fmt.Errorf("%w: unsupported obfs type %q", dialer.InvalidParameterErr, obfsType)
++	}
+ 	var insecure bool
+ 	if insecureValue := q.Get("insecure"); insecureValue != "" {
+ 		insecure, err = strconv.ParseBool(q.Get("insecure"))
+@@ -173,15 +191,17 @@ func ParseHysteria2URL(link string) (*Hysteria2, error) {
+ 		}
+ 	}
+ 	conf := &Hysteria2{
+-		Name:      u.Fragment,
+-		User:      u.User.Username(),
+-		Server:    u.Host,
+-		Insecure:  insecure,
+-		Sni:       q.Get("sni"),
+-		PinSHA256: q.Get("pinSHA256"),
+-		CA:        q.Get("ca"),
+-		MaxTx:     maxTx,
+-		MaxRx:     maxRx,
++		Name:         u.Fragment,
++		User:         u.User.Username(),
++		Server:       u.Host,
++		Insecure:     insecure,
++		Sni:          q.Get("sni"),
++		PinSHA256:    q.Get("pinSHA256"),
++		CA:           q.Get("ca"),
++		MaxTx:        maxTx,
++		MaxRx:        maxRx,
++		Obfs:         obfsType,
++		ObfsPassword: obfsPassword,
+ 	}
+ 	conf.Password, _ = u.User.Password()
+ 	return conf, nil
+@@ -210,6 +230,12 @@ func (s *Hysteria2) ExportToURL() string {
+ 	if s.CA != "" {
+ 		q.Set("ca", s.CA)
+ 	}
++	if s.Obfs != "" {
++		q.Set("obfs", s.Obfs)
++		if s.ObfsPassword != "" {
++			q.Set("obfs-password", s.ObfsPassword)
++		}
++	}
+ 	if s.MaxTx > 0 && s.MaxRx > 0 {
+ 		q.Set("maxTx", strconv.FormatUint(s.MaxTx, 10))
+ 		q.Set("maxRx", strconv.FormatUint(s.MaxRx, 10))
+diff --git a/dialer/hysteria2/hysteria2_url_test.go b/dialer/hysteria2/hysteria2_url_test.go
+new file mode 100644
+index 0000000..b235746
+--- /dev/null
++++ b/dialer/hysteria2/hysteria2_url_test.go
+@@ -0,0 +1,51 @@
++package hysteria2
++
++import "testing"
++
++func TestParseHysteria2URL_Obfs(t *testing.T) {
++	// Standard URI-scheme format (matches the common subscription format).
++	link := "hysteria2://user:pass@example.com:443/?obfs=salamander&obfs-password=cry_me_a_r1ver&sni=example.com#node"
++	s, err := ParseHysteria2URL(link)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if s.Obfs != "salamander" {
++		t.Fatalf("Obfs = %q, want salamander", s.Obfs)
++	}
++	if s.ObfsPassword != "cry_me_a_r1ver" {
++		t.Fatalf("ObfsPassword = %q", s.ObfsPassword)
++	}
++
++	// Export must round-trip the obfs parameters back.
++	out, err := ParseHysteria2URL(s.ExportToURL())
++	if err != nil {
++		t.Fatalf("re-parse exported URL: %v", err)
++	}
++	if out.Obfs != "salamander" || out.ObfsPassword != "cry_me_a_r1ver" {
++		t.Fatalf("round trip lost obfs: %+v", out)
++	}
++}
++
++func TestParseHysteria2URL_NoObfs(t *testing.T) {
++	s, err := ParseHysteria2URL("hysteria2://user:pass@example.com:443/#node")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if s.Obfs != "" || s.ObfsPassword != "" {
++		t.Fatalf("expected no obfs, got %+v", s)
++	}
++}
++
++func TestParseHysteria2URL_SalamanderMissingPassword(t *testing.T) {
++	_, err := ParseHysteria2URL("hysteria2://user:pass@example.com:443/?obfs=salamander#node")
++	if err == nil {
++		t.Fatal("expected error when obfs=salamander but no password")
++	}
++}
++
++func TestParseHysteria2URL_UnsupportedObfs(t *testing.T) {
++	_, err := ParseHysteria2URL("hysteria2://user:pass@example.com:443/?obfs=xor&obfs-password=x#node")
++	if err == nil {
++		t.Fatal("expected error for unsupported obfs type")
++	}
++}
+diff --git a/protocol/hysteria2/dialer.go b/protocol/hysteria2/dialer.go
+index 6c2bbd9..9634415 100644
+--- a/protocol/hysteria2/dialer.go
++++ b/protocol/hysteria2/dialer.go
+@@ -11,6 +11,7 @@ import (
+ 	"github.com/daeuniverse/outbound/netproxy"
+ 	"github.com/daeuniverse/outbound/protocol"
+ 	"github.com/daeuniverse/outbound/protocol/hysteria2/client"
++	"github.com/daeuniverse/outbound/protocol/hysteria2/obfs"
+ 	"github.com/daeuniverse/outbound/protocol/hysteria2/udphop"
+ 	"github.com/daeuniverse/outbound/protocol/tuic/common"
+ )
+@@ -27,6 +28,11 @@ type Dialer struct {
+ type Feature1 struct {
+ 	BandwidthConfig client.BandwidthConfig
+ 	UDPHopInterval  time.Duration
++	// ObfsType is the packet obfuscation type. "" means no obfuscation;
++	// "salamander" enables salamander obfuscation.
++	ObfsType string
++	// ObfsPassword is the pre-shared key for salamander obfuscation.
++	ObfsPassword string
+ }
+ 
+ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
+@@ -51,9 +57,33 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
+ 	if header.Password != "" {
+ 		config.Auth = header.User + ":" + header.Password
+ 	}
++	var obfuscator obfs.Obfuscator
+ 	if feature := header.Feature1; feature != nil {
+-		config.BandwidthConfig = feature.(*Feature1).BandwidthConfig
+-		config.UDPHopInterval = feature.(*Feature1).UDPHopInterval
++		f := feature.(*Feature1)
++		config.BandwidthConfig = f.BandwidthConfig
++		config.UDPHopInterval = f.UDPHopInterval
++		switch f.ObfsType {
++		case "", "plain":
++			// No obfuscation.
++		case "salamander":
++			var err error
++			if obfuscator, err = obfs.NewSalamanderObfuscator([]byte(f.ObfsPassword)); err != nil {
++				return nil, err
++			}
++		default:
++			return nil, fmt.Errorf("unsupported hysteria2 obfs type: %s", f.ObfsType)
++		}
++	}
++
++	// maybeObfs wraps pc with the obfuscation layer when one is configured.
++	// It must wrap the OUTERMOST PacketConn handed to quic-go (including the
++	// udphop conn) so that every QUIC packet is obfuscated regardless of which
++	// port it is currently hopping to.
++	maybeObfs := func(pc net.PacketConn) net.PacketConn {
++		if obfuscator == nil {
++			return pc
++		}
++		return obfs.WrapPacketConn(pc, obfuscator)
+ 	}
+ 
+ 	var err error
+@@ -91,7 +121,11 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
+ 						remoteAddr,
+ 					), nil
+ 				}
+-				return udphop.NewUDPHopPacketConn(config.ServerAddr.(*udphop.UDPHopAddr), config.UDPHopInterval, dialFunc)
++				hopConn, err := udphop.NewUDPHopPacketConn(config.ServerAddr.(*udphop.UDPHopAddr), config.UDPHopInterval, dialFunc)
++				if err != nil {
++					return nil, err
++				}
++				return maybeObfs(hopConn), nil
+ 			},
+ 		}
+ 	} else {
+@@ -105,11 +139,11 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
+ 				if addr := remoteAddrOf(conn); addr != nil {
+ 					remoteAddr = addr
+ 				}
+-				return netproxy.NewFakeNetPacketConn(
++				return maybeObfs(netproxy.NewFakeNetPacketConn(
+ 					conn.(netproxy.PacketConn),
+ 					net.UDPAddrFromAddrPort(common.GetUniqueFakeAddrPort()),
+ 					remoteAddr,
+-				), nil
++				)), nil
+ 			},
+ 		}
+ 	}
+diff --git a/protocol/hysteria2/obfs/obfs.go b/protocol/hysteria2/obfs/obfs.go
+new file mode 100644
+index 0000000..ed1f687
+--- /dev/null
++++ b/protocol/hysteria2/obfs/obfs.go
+@@ -0,0 +1,137 @@
++// Package obfs implements the packet obfuscation layer used by hysteria2.
++//
++// This part of the code is modified from apernet/hysteria
++// (https://github.com/apernet/hysteria) under the MIT License, with many
++// thanks. See the top-level LICENSE file for details.
++package obfs
++
++import (
++	"net"
++	"sync"
++	"time"
++)
++
++// smBufSize is the size of the read/write scratch buffers. QUIC packets are at
++// most ~1500 bytes; salamander adds an 8-byte salt, so 2048 is more than
++// enough.
++const smBufSize = 2048
++
++// Obfuscator is the interface for packet obfuscation. Implementations must be
++// safe for concurrent use.
++//
++// Both methods return the number of bytes written to out, or 0 if the input is
++// invalid (in which case the packet MUST be discarded by the caller).
++type Obfuscator interface {
++	// Obfuscate transforms the plaintext packet in into an obfuscated packet
++	// written to out. out must be large enough to hold the result.
++	Obfuscate(in, out []byte) int
++	// Deobfuscate reverses Obfuscate. A return value of 0 means the packet was
++	// invalid and must be dropped.
++	Deobfuscate(in, out []byte) int
++}
++
++// obfsPacketConn wraps a net.PacketConn, obfuscating every outbound packet and
++// deobfuscating every inbound one.
++//
++// IMPORTANT: this type deliberately implements ONLY the plain net.PacketConn
++// interface. It does NOT expose ReadMsgUDP/WriteMsgUDP (OOB batch I/O) or
++// SyscallConn. That is intentional: quic-go probes for those interfaces to use
++// GSO / raw-socket fast paths, and if it found them it would read and write the
++// underlying socket directly, bypassing obfuscation entirely. By exposing only
++// ReadFrom/WriteTo we force quic-go through this wrapper.
++type obfsPacketConn struct {
++	Conn net.PacketConn
++	Obfs Obfuscator
++
++	readMutex  sync.Mutex
++	readBuf    []byte
++	writeMutex sync.Mutex
++	writeBuf   []byte
++}
++
++// WrapPacketConn wraps conn so that every packet is (de)obfuscated by obfs.
++func WrapPacketConn(conn net.PacketConn, obfs Obfuscator) net.PacketConn {
++	return &obfsPacketConn{
++		Conn:     conn,
++		Obfs:     obfs,
++		readBuf:  make([]byte, smBufSize),
++		writeBuf: make([]byte, smBufSize),
++	}
++}
++
++func (c *obfsPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
++	for {
++		c.readMutex.Lock()
++		n, addr, err := c.Conn.ReadFrom(c.readBuf)
++		if n <= 0 {
++			c.readMutex.Unlock()
++			return 0, addr, err
++		}
++		newN := c.Obfs.Deobfuscate(c.readBuf[:n], p)
++		c.readMutex.Unlock()
++		if newN > 0 {
++			// Valid packet.
++			return newN, addr, err
++		} else if err != nil {
++			// Invalid packet and a connection error: propagate the error.
++			return 0, addr, err
++		}
++		// Invalid packet but no error: keep reading.
++	}
++}
++
++func (c *obfsPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
++	c.writeMutex.Lock()
++	bn := c.Obfs.Obfuscate(p, c.writeBuf)
++	if bn == 0 {
++		c.writeMutex.Unlock()
++		// Payload does not fit into the scratch buffer; report as written to
++		// avoid stalling the QUIC stack (matches a silent drop).
++		return len(p), nil
++	}
++	_, err := c.Conn.WriteTo(c.writeBuf[:bn], addr)
++	c.writeMutex.Unlock()
++	if err != nil {
++		return 0, err
++	}
++	// Report the length of the original (plaintext) payload, as the caller
++	// expects, not the on-wire obfuscated length.
++	return len(p), nil
++}
++
++func (c *obfsPacketConn) Close() error {
++	return c.Conn.Close()
++}
++
++func (c *obfsPacketConn) LocalAddr() net.Addr {
++	return c.Conn.LocalAddr()
++}
++
++func (c *obfsPacketConn) SetDeadline(t time.Time) error {
++	return c.Conn.SetDeadline(t)
++}
++
++func (c *obfsPacketConn) SetReadDeadline(t time.Time) error {
++	return c.Conn.SetReadDeadline(t)
++}
++
++func (c *obfsPacketConn) SetWriteDeadline(t time.Time) error {
++	return c.Conn.SetWriteDeadline(t)
++}
++
++// SetReadBuffer / SetWriteBuffer are forwarded so quic-go can still size the
++// underlying socket buffers. These do not expose the raw fd, so they are safe
++// to pass through.
++func (c *obfsPacketConn) SetReadBuffer(bytes int) error {
++	if sc, ok := c.Conn.(interface{ SetReadBuffer(int) error }); ok {
++		return sc.SetReadBuffer(bytes)
++	}
++	return nil
++}
++
++func (c *obfsPacketConn) SetWriteBuffer(bytes int) error {
++	if sc, ok := c.Conn.(interface{ SetWriteBuffer(int) error }); ok {
++		return sc.SetWriteBuffer(bytes)
++	}
++	return nil
++}
+diff --git a/protocol/hysteria2/obfs/salamander.go b/protocol/hysteria2/obfs/salamander.go
+new file mode 100644
+index 0000000..f70f476
+--- /dev/null
++++ b/protocol/hysteria2/obfs/salamander.go
+@@ -0,0 +1,93 @@
++package obfs
++
++import (
++	"fmt"
++	"math/rand"
++	"sync"
++	"time"
++
++	"golang.org/x/crypto/blake2b"
++)
++
++const (
++	smPSKMinLen = 4
++	smSaltLen   = 8
++	smKeyLen    = blake2b.Size256 // 32
++)
++
++var _ Obfuscator = (*SalamanderObfuscator)(nil)
++
++// ErrPSKTooShort is returned when the pre-shared key is shorter than the
++// minimum allowed length.
++var ErrPSKTooShort = fmt.Errorf("obfs password (PSK) must be at least %d bytes", smPSKMinLen)
++
++// SalamanderObfuscator obfuscates each packet with the BLAKE2b-256 hash of a
++// pre-shared key combined with a per-packet random salt.
++//
++// Wire format: [8-byte salt][payload], where
++//
++//	key      = BLAKE2b-256(PSK || salt)     // 32 bytes
++//	out[i]   = payload[i] ^ key[i % 32]
++//
++// XOR is self-inverting, so Obfuscate and Deobfuscate share the same routine.
++// This matches the algorithm described at
++// https://v2.hysteria.network/docs/developers/Protocol/#salamander-obfuscation
++// and is wire-compatible with the standard hysteria2 server.
++type SalamanderObfuscator struct {
++	PSK     []byte
++	RandSrc *rand.Rand
++
++	lk       sync.Mutex
++	keyInput []byte // reused scratch: PSK || salt, guarded by lk
++}
++
++// NewSalamanderObfuscator creates a salamander obfuscator from the given PSK.
++func NewSalamanderObfuscator(psk []byte) (*SalamanderObfuscator, error) {
++	if len(psk) < smPSKMinLen {
++		return nil, ErrPSKTooShort
++	}
++	pskCopy := append([]byte(nil), psk...)
++	keyInput := make([]byte, len(pskCopy)+smSaltLen)
++	copy(keyInput, pskCopy)
++	return &SalamanderObfuscator{
++		PSK:      pskCopy,
++		RandSrc:  rand.New(rand.NewSource(time.Now().UnixNano())),
++		keyInput: keyInput,
++	}, nil
++}
++
++func (o *SalamanderObfuscator) Obfuscate(in, out []byte) int {
++	outLen := len(in) + smSaltLen
++	if len(out) < outLen {
++		return 0
++	}
++	o.lk.Lock()
++	_, _ = o.RandSrc.Read(out[:smSaltLen])
++	key := o.keyLocked(out[:smSaltLen])
++	o.lk.Unlock()
++	for i, c := range in {
++		out[i+smSaltLen] = c ^ key[i%smKeyLen]
++	}
++	return outLen
++}
++
++func (o *SalamanderObfuscator) Deobfuscate(in, out []byte) int {
++	outLen := len(in) - smSaltLen
++	if outLen <= 0 || len(out) < outLen {
++		return 0
++	}
++	o.lk.Lock()
++	key := o.keyLocked(in[:smSaltLen])
++	o.lk.Unlock()
++	for i, c := range in[smSaltLen:] {
++		out[i] = c ^ key[i%smKeyLen]
++	}
++	return outLen
++}
++
++// keyLocked computes BLAKE2b-256(PSK || salt). Caller must hold o.lk because it
++// mutates the shared keyInput scratch buffer.
++func (o *SalamanderObfuscator) keyLocked(salt []byte) [smKeyLen]byte {
++	copy(o.keyInput[len(o.PSK):], salt[:smSaltLen])
++	return blake2b.Sum256(o.keyInput)
++}
+diff --git a/protocol/hysteria2/obfs/salamander_test.go b/protocol/hysteria2/obfs/salamander_test.go
+new file mode 100644
+index 0000000..c873f00
+--- /dev/null
++++ b/protocol/hysteria2/obfs/salamander_test.go
+@@ -0,0 +1,154 @@
++package obfs
++
++import (
++	"bytes"
++	"net"
++	"sync"
++	"testing"
++	"time"
++)
++
++func TestSalamanderRoundTrip(t *testing.T) {
++	psk := []byte("cry_me_a_r1ver")
++	// Two independent instances sharing the PSK simulate client and server.
++	client, err := NewSalamanderObfuscator(psk)
++	if err != nil {
++		t.Fatal(err)
++	}
++	server, err := NewSalamanderObfuscator(psk)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	for _, payload := range [][]byte{
++		[]byte(""),
++		[]byte("a"),
++		bytes.Repeat([]byte("hysteria2-quic-packet"), 70), // ~1470 bytes
++	} {
++		obf := make([]byte, len(payload)+smSaltLen)
++		n := client.Obfuscate(payload, obf)
++		if n != len(payload)+smSaltLen {
++			t.Fatalf("Obfuscate len = %d, want %d", n, len(payload)+smSaltLen)
++		}
++		got := make([]byte, len(payload))
++		m := server.Deobfuscate(obf[:n], got)
++		if m != len(payload) {
++			t.Fatalf("Deobfuscate len = %d, want %d", m, len(payload))
++		}
++		if !bytes.Equal(got[:m], payload) {
++			t.Fatalf("round trip mismatch: got %q want %q", got[:m], payload)
++		}
++	}
++}
++
++func TestSalamanderPerPacketSalt(t *testing.T) {
++	o, err := NewSalamanderObfuscator([]byte("password"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	payload := []byte("same plaintext every time")
++	out1 := make([]byte, len(payload)+smSaltLen)
++	out2 := make([]byte, len(payload)+smSaltLen)
++	o.Obfuscate(payload, out1)
++	o.Obfuscate(payload, out2)
++	if bytes.Equal(out1, out2) {
++		t.Fatal("two obfuscations of the same payload produced identical output; salt not randomized")
++	}
++}
++
++func TestSalamanderPSKTooShort(t *testing.T) {
++	if _, err := NewSalamanderObfuscator([]byte("abc")); err != ErrPSKTooShort {
++		t.Fatalf("expected ErrPSKTooShort, got %v", err)
++	}
++}
++
++func TestSalamanderInvalidPacketDropped(t *testing.T) {
++	o, err := NewSalamanderObfuscator([]byte("password"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	out := make([]byte, 64)
++	// Packet shorter than the salt must be reported invalid (0).
++	if n := o.Deobfuscate([]byte{1, 2, 3}, out); n != 0 {
++		t.Fatalf("expected 0 for too-short packet, got %d", n)
++	}
++}
++
++// fakePacketConn is an in-memory net.PacketConn pair used to exercise
++// WrapPacketConn end to end.
++type fakePacketConn struct {
++	ch     chan []byte
++	peer   *fakePacketConn
++	local  net.Addr
++	closed chan struct{}
++	once   sync.Once
++}
++
++func newFakePair() (*fakePacketConn, *fakePacketConn) {
++	a := &fakePacketConn{ch: make(chan []byte, 16), local: &net.UDPAddr{IP: net.IPv4(1, 1, 1, 1), Port: 1}, closed: make(chan struct{})}
++	b := &fakePacketConn{ch: make(chan []byte, 16), local: &net.UDPAddr{IP: net.IPv4(2, 2, 2, 2), Port: 2}, closed: make(chan struct{})}
++	a.peer, b.peer = b, a
++	return a, b
++}
++
++func (c *fakePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
++	select {
++	case b := <-c.ch:
++		return copy(p, b), c.peer.local, nil
++	case <-c.closed:
++		return 0, nil, net.ErrClosed
++	}
++}
++
++func (c *fakePacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
++	b := append([]byte(nil), p...)
++	select {
++	case c.peer.ch <- b:
++		return len(p), nil
++	case <-c.closed:
++		return 0, net.ErrClosed
++	}
++}
++
++func (c *fakePacketConn) Close() error {
++	c.once.Do(func() { close(c.closed) })
++	return nil
++}
++func (c *fakePacketConn) LocalAddr() net.Addr                { return c.local }
++func (c *fakePacketConn) SetDeadline(t time.Time) error      { return nil }
++func (c *fakePacketConn) SetReadDeadline(t time.Time) error  { return nil }
++func (c *fakePacketConn) SetWriteDeadline(t time.Time) error { return nil }
++
++func TestWrapPacketConnRoundTrip(t *testing.T) {
++	psk := []byte("shared-secret")
++	cliObfs, _ := NewSalamanderObfuscator(psk)
++	srvObfs, _ := NewSalamanderObfuscator(psk)
++
++	rawA, rawB := newFakePair()
++	cli := WrapPacketConn(rawA, cliObfs)
++	srv := WrapPacketConn(rawB, srvObfs)
++	defer cli.Close()
++	defer srv.Close()
++
++	payload := []byte("the quick brown fox jumps over the lazy dog")
++	if _, err := cli.WriteTo(payload, srv.LocalAddr()); err != nil {
++		t.Fatal(err)
++	}
++
++	// Assert the bytes on the wire are actually obfuscated (not plaintext).
++	onWire := <-rawB.ch
++	if bytes.Contains(onWire, payload) {
++		t.Fatal("plaintext leaked onto the wire; obfuscation not applied")
++	}
++	// Put it back for srv to read.
++	rawB.ch <- onWire
++
++	buf := make([]byte, 2048)
++	n, _, err := srv.ReadFrom(buf)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Equal(buf[:n], payload) {
++		t.Fatalf("round trip mismatch: got %q want %q", buf[:n], payload)
++	}
++}
