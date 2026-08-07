@@ -317,11 +317,51 @@ jobs:
           docker run --rm -v "$PWD:/w" -w /w alpine:edge sh -c \
             'apk adbdump dist-pkg/*.apk | head -40'
 
-      - name: Upload packages (artifact)
+      # The end-user artifact: a makeself self-extracting installer, the shape
+      # luci-app-daed-runfiles distributes. One per OpenWrt generation, since
+      # each has to call a different package manager.
+      - name: Build .run self-extracting installers
+        run: |
+          set -euxo pipefail
+          sudo apt-get install -y makeself
+          V='${{ steps.ver.outputs.version }}'
+          A='${{ matrix.pkgarch }}'
+          packaging/openwrt/make-runfile.sh --kind ipk \
+            --label "daed + salamander $V ($A, OpenWrt <= 24.10)" \
+            --out "dist-run/24-daed-salamander_${V}-${A}.run" \
+            dist-pkg/*.ipk
+          packaging/openwrt/make-runfile.sh --kind apk \
+            --label "daed + salamander $V ($A, OpenWrt >= 25.12)" \
+            --out "dist-run/25-daed-salamander_${V}-${A}.run" \
+            dist-pkg/*.apk
+
+      - name: Verify the installers
+        run: |
+          set -euxo pipefail
+          for r in dist-run/*.run; do
+            # --list and --check exercise makeself's own header only; neither
+            # runs the bundled install.sh.
+            sh "$r" --list
+            sh "$r" --check
+            sh "$r" --list | grep -q 'install\.sh'
+          done
+          ls -la dist-run
+
+      # Flatten before upload: upload-artifact roots a multi-path upload at the
+      # least common ancestor, which would bury everything one level deeper and
+      # break the publish job's glob.
+      - name: Collect
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          cp dist-pkg/* dist-run/* dist/
+          ls -la dist
+
+      - name: Upload packages and installers (artifact)
         uses: actions/upload-artifact@v4
         with:
           name: daed-openwrt-${{ matrix.pkgarch }}
-          path: dist-pkg/*
+          path: dist/*
           if-no-files-found: error
 
   # Single publisher: three matrix jobs pushing assets to the same release tag

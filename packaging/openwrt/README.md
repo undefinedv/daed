@@ -17,12 +17,35 @@ is just metadata around a file tree.
 | arm64 | `aarch64_generic` | 64-bit ARM |
 | amd64 | `x86_64` | 64-bit x86 |
 
-Two formats per architecture, because OpenWrt changed package managers:
+Two package formats per architecture, because OpenWrt changed package managers:
 
 - `daed_<version>_<arch>.ipk` — opkg, OpenWrt **24.10 and earlier**
 - `daed-<version>-<arch>.apk` — apk-tools 3, OpenWrt **25.12 and later**
 
+…and each is also wrapped in a makeself self-extracting installer, which is the
+artifact most people actually want:
+
+- `24-daed-salamander_<version>-<arch>.run` — for OpenWrt <= 24.10
+- `25-daed-salamander_<version>-<arch>.run` — for OpenWrt >= 25.12
+
 ## Installing
+
+The `.run` unpacks to a temp dir and runs its bundled `install.sh`, which calls
+the package manager for you:
+
+```sh
+chmod +x ./24-daed-salamander_2026.08.08-r1-arm_cortex-a9.run
+./24-daed-salamander_2026.08.08-r1-arm_cortex-a9.run
+```
+
+Useful flags before committing to it — neither runs `install.sh`:
+
+```sh
+./…​.run --list    # show what is inside
+./…​.run --check   # verify the embedded checksum
+```
+
+Or install the package directly, skipping the wrapper:
 
 ```sh
 # OpenWrt <= 24.10
@@ -48,6 +71,15 @@ v2ray-geoip v2ray-geosite`. The two `kmod-sched-*` packages are what supply the
 `NET_SCH_INGRESS` / `NET_CLS_BPF` / `NET_ACT_BPF` modules dae attaches to, and
 they must match the running kernel exactly, so install them from the same build
 as your firmware.
+
+None of those are bundled inside the `.run` — `install.sh` runs `opkg update` /
+`apk update` first and lets the package manager pull them from the router's
+feeds, so the device needs working connectivity at install time. The reference
+`luci-app-daed-runfiles` archives additionally ship `luci-app-daed`,
+`luci-i18n-daed-zh-cn`, `v2ray-geoip`, `v2ray-geosite` and a kernel-specific
+`vmlinux-btf` package inside the archive. Those are not this repository's build
+output, and a self-compiled kernel with `CONFIG_DEBUG_INFO_BTF=y` does not need
+`vmlinux-btf` at all.
 
 The kernel itself still has to satisfy dae: **>= 5.17** with BTF. See the notes
 at the bottom of `build-salamander.yml`.
