@@ -388,20 +388,43 @@ jobs:
             --out "dist-run/25-daed-salamander_${V}-${A}.run" \
             dist-apk/*.apk
 
+      # --list and --check exercise makeself's own header only; neither runs the
+      # bundled install.sh.
+      #
+      # Each listing is captured to a file rather than piped into grep. Piping
+      # into `grep -q` is a trap here: grep exits at the first match and closes
+      # the pipe, makeself's `dd | gzip -dc | tar` takes SIGPIPE and dies
+      # ("Extraction failed. Terminated"), and `set -o pipefail` then reports the
+      # whole pipeline as failed even though the entry was found. Whether it
+      # loses that race depends on payload size, so it passes on a small test
+      # archive and fails on the real 22MB one.
       - name: Verify the installers
         run: |
-          set -euxo pipefail
+          set -eux
+          ls -la dist-run
+          mkdir -p /tmp/listings
           for r in dist-run/*.run; do
-            # --list and --check exercise makeself's own header only; neither
-            # runs the bundled install.sh.
-            sh "$r" --list
             sh "$r" --check
-            # Assert the full set made it in, not just install.sh.
-            for want in 'install\.sh' 'daed' 'luci-app-daed' 'luci-i18n-daed-zh-cn' 'v2ray-geoip' 'v2ray-geosite'; do
-              sh "$r" --list | grep -q "$want" || { echo "$r is missing $want"; exit 1; }
+            sh "$r" --list > "/tmp/listings/$(basename "$r").txt"
+            cat "/tmp/listings/$(basename "$r").txt"
+          done
+
+      - name: Verify the installers carry the whole set
+        run: |
+          set -eu
+          rc=0
+          for l in /tmp/listings/*.txt; do
+            # daed[-_][0-9] so the package itself matches but luci-app-daed and
+            # luci-i18n-daed-zh-cn cannot stand in for it.
+            for want in 'install\.sh' 'daed[-_][0-9]' 'luci-app-daed' \
+                        'luci-i18n-daed-zh-cn' 'v2ray-geoip' 'v2ray-geosite'; do
+              if ! grep -Eq "$want" "$l"; then
+                echo "MISSING from $(basename "$l"): $want"
+                rc=1
+              fi
             done
           done
-          ls -la dist-run
+          exit $rc
 
       # Flatten before upload: upload-artifact roots a multi-path upload at the
       # least common ancestor, which would bury everything one level deeper and
