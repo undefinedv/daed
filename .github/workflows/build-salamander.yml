@@ -32,6 +32,9 @@ on:
       version:
         description: "VERSION string stamped into the binary"
         default: "salamander"
+      luci_ref:
+        description: "wkccd/luci-app-daed-runfiles commit to take the LuCI app from"
+        default: "6363d2fb9103361435513475ae93fa6fa0bcad38"
       upx:
         description: "Compress the binary with UPX (true/false)"
         default: "true"
@@ -259,6 +262,28 @@ jobs:
           # number doubles as the package release. Same value feeds both formats.
           echo "version=$(date -u +%Y.%m.%d)-r${{ github.run_number }}" >> "$GITHUB_OUTPUT"
 
+      - name: Fetch luci-app-daed sources and build po2lmo
+        run: |
+          set -euxo pipefail
+          # The LuCI app is not this repository's code; clone it at a pinned
+          # commit, the same way this workflow pins outbound and dae-core.
+          git clone https://github.com/wkccd/luci-app-daed-runfiles.git /tmp/luci-src
+          git -C /tmp/luci-src checkout "${{ github.event.inputs.luci_ref || '6363d2fb9103361435513475ae93fa6fa0bcad38' }}"
+          # LuCI ships translations as a binary .lmo catalogue, so the .po has
+          # to be compiled. po2lmo is glibc-linked here, which is why staging
+          # happens on the runner and only packaging runs inside Alpine.
+          packaging/openwrt/build-po2lmo.sh /tmp/po2lmo
+
+      - name: Stage the file trees
+        run: |
+          set -euxo pipefail
+          S=packaging/openwrt/stage.sh
+          L=/tmp/luci-src/luci-app-daed
+          "$S" daed "artifact/daed-linux-${{ matrix.name }}" stage/daed
+          "$S" luci-app "$L" stage/luci-app
+          "$S" luci-i18n "$L" /tmp/po2lmo stage/luci-i18n
+          find stage -type f | sort
+
       - name: Build ipk (opkg, OpenWrt <= 24.10)
         env:
           # Fixed epoch keeps ipkg-build's tar timestamps reproducible and
@@ -273,12 +298,8 @@ jobs:
             https://raw.githubusercontent.com/openwrt/openwrt/openwrt-24.10/scripts/ipkg-build
           chmod +x /tmp/ipkg-build
           # fakeroot so the archived files are owned by root, not the runner.
-          fakeroot env IPKG_BUILD=/tmp/ipkg-build SOURCE_DATE_EPOCH=0 \
-            packaging/openwrt/build-package.sh \
-              --bin "artifact/daed-linux-${{ matrix.name }}" \
-              --arch "${{ matrix.pkgarch }}" \
-              --version "${{ steps.ver.outputs.version }}" \
-              --format ipk --out dist-pkg
+          fakeroot env IPKG_BUILD=/tmp/ipkg-build SOURCE_DATE_EPOCH=0 sh -eux packaging/openwrt/build-all.sh \
+            ipk "${{ matrix.pkgarch }}" "${{ steps.ver.outputs.version }}" dist-ipk
 
       - name: Build apk (apk-tools 3, OpenWrt >= 25.12)
         run: |
@@ -289,20 +310,43 @@ jobs:
           # in a container-local tmpdir rather than on the bind mount.
           docker run --rm -v "$PWD:/w" -w /w alpine:edge sh -eux -c '
             apk --version || true
-            packaging/openwrt/build-package.sh \
-              --bin "artifact/daed-linux-${{ matrix.name }}" \
-              --arch "${{ matrix.pkgarch }}" \
-              --version "${{ steps.ver.outputs.version }}" \
-              --format apk --out dist-pkg
+            sh -eux packaging/openwrt/build-all.sh \
+              apk "${{ matrix.pkgarch }}" "${{ steps.ver.outputs.version }}" dist-apk
           '
           # Bind-mounted output is written by the container's root.
-          sudo chown -R "$(id -u):$(id -g)" dist-pkg
+          sudo chown -R "$(id -u):$(id -g)" dist-apk
+
+      - name: Fetch v2ray geodata from the OpenWrt feeds
+        run: |
+          set -euxo pipefail
+          # Bundled so the installer works without the router reaching a feed
+          # for them; this is what the reference .run archives carry too.
+          # Resolve the newest point release of each series rather than pinning
+          # a version that will rot.
+          latest() {
+            curl -fsSL https://downloads.openwrt.org/releases/ \
+              | grep -o "href=\"$1\.[0-9]\+/\"" | sed 's/href="//; s|/"||' | sort -V | tail -1
+          }
+          grab() { # <release> <arch> <ext> <regex> <destdir>
+            base="https://downloads.openwrt.org/releases/$1/packages/$2/packages/"
+            f=$(curl -fsSL "$base" | grep -o "href=\"$4\"" | sed 's/href="//; s/"//' | sort -V | tail -1)
+            [ -n "$f" ] || { echo "not found in $base: $4"; exit 1; }
+            curl -fsSL -o "$5/$f" "$base$f"
+          }
+          R24=$(latest 24.10); R25=$(latest 25.12)
+          echo "using OpenWrt $R24 (ipk) and $R25 (apk)"
+          # geosite-ir is a different package; require a digit after the dash so
+          # it does not shadow plain geosite.
+          grab "$R24" "${{ matrix.pkgarch }}" ipk 'v2ray-geoip_[^"]*\.ipk'    dist-ipk
+          grab "$R24" "${{ matrix.pkgarch }}" ipk 'v2ray-geosite_[^"]*\.ipk'  dist-ipk
+          grab "$R25" "${{ matrix.pkgarch }}" apk 'v2ray-geoip-[0-9][^"]*\.apk'   dist-apk
+          grab "$R25" "${{ matrix.pkgarch }}" apk 'v2ray-geosite-[0-9][^"]*\.apk' dist-apk
+          ls -la dist-ipk dist-apk
 
       - name: Inspect the packages
         run: |
           set -euxo pipefail
-          ls -la dist-pkg
-          IPK=$(ls dist-pkg/*.ipk)
+          IPK=$(ls dist-ipk/daed_*.ipk)
           # `-f -` is required: GNU tar does not default to stdin the way bsdtar does.
           tar xzf "$IPK" -O ./control.tar.gz | tar -xzO -f - ./control
           tar xzf "$IPK" -O ./data.tar.gz | tar -tvz -f -
@@ -313,6 +357,11 @@ jobs:
           size=$(stat -c%s "$IPK")
           echo "ipk size: $size"
           [ "$size" -gt 1000000 ] || { echo "ipk is implausibly small"; exit 1; }
+          # The translation catalogue is the one piece with a real build step
+          # behind it, so confirm it is non-empty rather than a zero-byte stub.
+          LMO=$(ls dist-ipk/luci-i18n-daed-zh-cn_*.ipk)
+          tar xzf "$LMO" -O ./data.tar.gz | tar -tvz -f - \
+            | grep 'i18n/daed\.zh-cn\.lmo' | awk '{ if ($3 < 100) exit 1 }'
           # Round-trip the apk through apk-tools to prove it is well-formed.
           docker run --rm -v "$PWD:/w" -w /w alpine:edge sh -c \
             'apk adbdump dist-pkg/*.apk | head -40'
@@ -326,14 +375,18 @@ jobs:
           sudo apt-get install -y makeself
           V='${{ steps.ver.outputs.version }}'
           A='${{ matrix.pkgarch }}'
+          # Everything the router needs goes inside: daed, the LuCI app and its
+          # translation, and the geodata. Only the kmods are left to the feed,
+          # since those must match the running kernel exactly and a bundled copy
+          # would be wrong more often than right.
           packaging/openwrt/make-runfile.sh --kind ipk \
             --label "daed + salamander $V ($A, OpenWrt <= 24.10)" \
             --out "dist-run/24-daed-salamander_${V}-${A}.run" \
-            dist-pkg/*.ipk
+            dist-ipk/*.ipk
           packaging/openwrt/make-runfile.sh --kind apk \
             --label "daed + salamander $V ($A, OpenWrt >= 25.12)" \
             --out "dist-run/25-daed-salamander_${V}-${A}.run" \
-            dist-pkg/*.apk
+            dist-apk/*.apk
 
       - name: Verify the installers
         run: |
@@ -343,7 +396,10 @@ jobs:
             # runs the bundled install.sh.
             sh "$r" --list
             sh "$r" --check
-            sh "$r" --list | grep -q 'install\.sh'
+            # Assert the full set made it in, not just install.sh.
+            for want in 'install\.sh' 'daed' 'luci-app-daed' 'luci-i18n-daed-zh-cn' 'v2ray-geoip' 'v2ray-geosite'; do
+              sh "$r" --list | grep -q "$want" || { echo "$r is missing $want"; exit 1; }
+            done
           done
           ls -la dist-run
 
@@ -354,7 +410,7 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p dist
-          cp dist-pkg/* dist-run/* dist/
+          cp dist-ipk/* dist-apk/* dist-run/* dist/
           ls -la dist
 
       - name: Upload packages and installers (artifact)
