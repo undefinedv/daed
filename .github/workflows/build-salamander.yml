@@ -1,7 +1,14 @@
-name: Build daed (arm64 + salamander)
+name: Build daed (arm64 / armv7 / amd64 + salamander)
 
-# Manually-triggered build that produces a FULLY-STATIC linux/arm64 `daed`
-# binary with hysteria2 salamander obfuscation patched into the outbound dialer.
+# Manually-triggered build that produces FULLY-STATIC linux `daed` binaries
+# with hysteria2 salamander obfuscation patched into the outbound dialer.
+#
+# armv7 (GOARCH=arm GOARM=7) targets 32-bit ARM routers such as the Phicomm K3
+# (BCM4709C0, dual Cortex-A9 = ARMv7 with VFPv3). Upstream daed never ships a
+# 32-bit ARM asset, but dae-core does (dae-linux-armv7), and daed is pure Go
+# with CGO off, so the only thing missing was the matrix entry itself.
+# The embedded eBPF is unaffected: control/kern is generated for bpfel,bpfeb
+# (endianness, not word size), so the same object serves arm and arm64.
 #
 # Why fully-static: the target router runs OpenWrt (musl libc). A dynamically
 # linked glibc binary will NOT load there. A fully-static binary has no runtime
@@ -34,14 +41,25 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest # x86; amd64 builds natively, arm64 cross-compiles (CGO off)
+    runs-on: ubuntu-latest # x86; amd64 builds natively, arm/arm64 cross-compile (CGO off)
     strategy:
       fail-fast: false
       matrix:
-        goarch: [arm64, amd64] # build both; pick the one matching each device
+        # `name` is the user-facing suffix (daed-linux-<name>); goarch/goarm are
+        # what Go actually consumes. Pick the one matching each device.
+        include:
+          - name: arm64
+            goarch: arm64
+          - name: armv7 # Phicomm K3 and other Cortex-A8/A9 routers
+            goarch: arm
+            goarm: "7"
+          - name: amd64
+            goarch: amd64
     env:
       GOOS: linux
       GOARCH: ${{ matrix.goarch }}
+      # Empty for non-arm targets; the Go toolchain treats GOARM="" as unset.
+      GOARM: ${{ matrix.goarm }}
       CGO_ENABLED: "0" # -> fully static, musl-compatible, no cross C toolchain
       GOFLAGS: "-mod=mod" # allow go to reconcile go.mod/go.sum after bumping dae-core
     steps:
@@ -109,7 +127,7 @@ jobs:
       - name: "Build phase 1: eBPF + codegen (host-native)"
         run: |
           set -euxo pipefail
-          go version; echo "host arch: $(go env GOHOSTARCH); target: $(go env GOARCH)"
+          go version; echo "host arch: $(go env GOHOSTARCH); target: $(go env GOARCH)$(go env GOARM)"
           # Must run on the amd64 host: bpf2go / gqlgen are executed via
           # `go run`/`go generate`. Strip cross vars so they don't cross-build.
           cd wing && env -u GOOS -u GOARCH -u GOARM -u CC -u CGO_ENABLED make deps
@@ -130,24 +148,27 @@ jobs:
           rm -rf dist && cp -r apps/web/dist dist
           ls -la dist | head
 
-      - name: "Build phase 3: static bundle (${{ matrix.goarch }})"
+      - name: "Build phase 3: static bundle (${{ matrix.name }})"
         run: |
           set -euxo pipefail
           cd wing && make OUTPUT=../daed APPNAME=daed WEB_DIST=../dist \
             VERSION="${{ github.event.inputs.version || 'salamander' }}-$(date +%Y%m%d)" bundle
 
-      - name: Verify the binary is ${{ matrix.goarch }} AND fully static
+      - name: Verify the binary is ${{ matrix.name }} AND fully static
         run: |
           set -euxo pipefail
           file ./daed
           # Fail the build if it is not statically linked (would not run on musl).
-          case "${{ matrix.goarch }}" in
-            arm64) file ./daed | grep -q "ARM aarch64" ;;
+          case "${{ matrix.name }}" in
+            arm64) file ./daed | grep -q "ELF 64-bit" && file ./daed | grep -q "ARM aarch64" ;;
+            # 32-bit ARM: `file` reports "ELF 32-bit LSB executable, ARM, EABI5".
+            # Assert 32-bit explicitly so an accidental arm64 build can't pass.
+            armv7) file ./daed | grep -q "ELF 32-bit" && file ./daed | grep -qE "ARM, EABI" ;;
             amd64) file ./daed | grep -q "x86-64" ;;
           esac
           file ./daed | grep -q "statically linked"
-          # Arch-suffixed name so the two matrix jobs don't collide.
-          cp daed "daed-linux-${{ matrix.goarch }}"
+          # Arch-suffixed name so the matrix jobs don't collide.
+          cp daed "daed-linux-${{ matrix.name }}"
 
       # UPX runs AFTER the static-linkage gate (which must see the raw ELF).
       # UPX itself is amd64 and cross-compresses both target arches. daed's
@@ -164,15 +185,15 @@ jobs:
           tar -C /tmp -xf /tmp/upx.tar.xz
           UPX="/tmp/upx-${UPX_VER}-amd64_linux/upx"
           "$UPX" --version | head -1
-          BIN="daed-linux-${{ matrix.goarch }}"
+          BIN="daed-linux-${{ matrix.name }}"
           before=$(stat -c%s "$BIN")
           "$UPX" --best --lzma --no-progress "$BIN"
           after=$(stat -c%s "$BIN")
           echo "UPX: $BIN  $before -> $after bytes ($(( after * 100 / before ))%)"
           file "$BIN"
           # Smoke test: the amd64 packed binary can run on this x86 runner
-          # (--version needs no privileges). arm64 is verified on the router.
-          if [ "${{ matrix.goarch }}" = "amd64" ]; then
+          # (--version needs no privileges). arm/arm64 are verified on the router.
+          if [ "${{ matrix.name }}" = "amd64" ]; then
             chmod +x "$BIN"
             "./$BIN" --version
           fi
@@ -180,8 +201,8 @@ jobs:
       - name: Upload binary (artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: daed-linux-${{ matrix.goarch }}-salamander
-          path: daed-linux-${{ matrix.goarch }}
+          name: daed-linux-${{ matrix.name }}-salamander
+          path: daed-linux-${{ matrix.name }}
           if-no-files-found: error
 
       - name: Publish binary as a Release asset (public, curl-able)
@@ -189,8 +210,8 @@ jobs:
         with:
           tag_name: salamander-latest
           name: daed + salamander (latest)
-          body: Fully-static linux daed with hysteria2 salamander obfuscation (arm64 + amd64).
-          files: daed-linux-${{ matrix.goarch }}
+          body: Fully-static linux daed with hysteria2 salamander obfuscation (arm64 + armv7 + amd64).
+          files: daed-linux-${{ matrix.name }}
           fail_on_unmatched_files: true
 
 # ---------------------------------------------------------------------------
@@ -208,4 +229,27 @@ jobs:
 # Fallback B — CGO=1 static cross-compile from x86 with a musl toolchain:
 #   install: sudo apt-get install -y musl-tools clang llvm libelf-dev
 #   env:     CC=aarch64-linux-musl-gcc (from the musl.cc cross toolchain)
+#
+# Fallback C — armv7 traps on floating point (SIGILL) on a board whose CPU
+#   lacks VFPv3: rebuild that matrix entry with `goarm: "5"`, which makes Go
+#   emit software floating point. Slower, but runs on any ARMv5+ core.
+#   (Not expected on the K3: its Cortex-A9 has VFPv3-d16.)
+#
+# NOTE for 32-bit ARM routers: producing the binary is only half the job — the
+# kernel has to cooperate. Per dae's docs, binding to LAN *or* WAN needs
+# kernel >= 5.17 (>= 5.15 for `dae trace`), plus these config items, which
+# embedded distros switch off to save space:
+#     CONFIG_BPF{,_SYSCALL,_JIT,_EVENTS,_STREAM_PARSER}=y
+#     CONFIG_CGROUPS=y CONFIG_KPROBES=y CONFIG_KPROBE_EVENTS=y
+#     CONFIG_NET_INGRESS=y CONFIG_NET_EGRESS=y CONFIG_NET_CLS_ACT=y
+#     CONFIG_NET_SCH_INGRESS=m CONFIG_NET_CLS_BPF=m
+#     CONFIG_DEBUG_INFO=y CONFIG_DEBUG_INFO_BTF=y
+#     # CONFIG_DEBUG_INFO_REDUCED is not set
+# When rolling your own OpenWrt, the corresponding menuconfig symbols live
+# under Global build settings -> Kernel build options:
+#     KERNEL_DEBUG_INFO=y, KERNEL_DEBUG_INFO_BTF=y,
+#     KERNEL_DEBUG_INFO_REDUCED=n  <-- defaults to *y*; BTF depends on it
+#                                      being off, so it must be unticked first
+# Verify on the device: `uname -r`, `ls -l /sys/kernel/btf/vmlinux`, and
+#     zcat /proc/config.gz | grep -E 'BTF|BPF|NET_CLS'
 # ---------------------------------------------------------------------------
