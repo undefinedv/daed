@@ -214,6 +214,145 @@ jobs:
           files: daed-linux-${{ matrix.name }}
           fail_on_unmatched_files: true
 
+  # Wrap each binary into installable OpenWrt packages, the way
+  # luci-app-daed-runfiles ships them: procd init script + uci config + the
+  # daed binary, with the dependency list opkg/apk needs to pull in
+  # kmod-sched-{core,bpf} etc.
+  #
+  # This repackages rather than rebuilding through the OpenWrt SDK: the
+  # binaries are CGO_ENABLED=0 fully-static, so they need no target toolchain
+  # and the archive is pure metadata around a file tree.
+  #
+  # Both package formats are produced because OpenWrt switched package managers:
+  # ipk for <= 24.10 (opkg), apk for >= 25.12 (apk-tools 3).
+  package:
+    name: OpenWrt package (${{ matrix.name }})
+    needs: build
+    # Per-arch, so a failure in one architecture's build does not withhold the
+    # packages for the architectures that did build.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: arm64
+            pkgarch: aarch64_generic
+          - name: armv7
+            pkgarch: arm_cortex-a9 # bcm53xx / Phicomm K3
+          - name: amd64
+            pkgarch: x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the ${{ matrix.name }} binary
+        uses: actions/download-artifact@v4
+        with:
+          name: daed-linux-${{ matrix.name }}-salamander
+          path: artifact
+
+      - name: Compute package version
+        id: ver
+        run: |
+          set -euxo pipefail
+          # apk's version grammar allows digits/dots then -r<n>, so the run
+          # number doubles as the package release. Same value feeds both formats.
+          echo "version=$(date -u +%Y.%m.%d)-r${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build ipk (opkg, OpenWrt <= 24.10)
+        env:
+          # Fixed epoch keeps ipkg-build's tar timestamps reproducible and
+          # sidesteps its locale-dependent `date` parsing.
+          SOURCE_DATE_EPOCH: "0"
+        run: |
+          set -euxo pipefail
+          sudo apt-get update && sudo apt-get install -y fakeroot
+          # OpenWrt's own packaging script, so the archive layout and the
+          # Installed-Size/conffiles handling match what opkg expects.
+          curl -fsSL -o /tmp/ipkg-build \
+            https://raw.githubusercontent.com/openwrt/openwrt/openwrt-24.10/scripts/ipkg-build
+          chmod +x /tmp/ipkg-build
+          # fakeroot so the archived files are owned by root, not the runner.
+          fakeroot env IPKG_BUILD=/tmp/ipkg-build SOURCE_DATE_EPOCH=0 \
+            packaging/openwrt/build-package.sh \
+              --bin "artifact/daed-linux-${{ matrix.name }}" \
+              --arch "${{ matrix.pkgarch }}" \
+              --version "${{ steps.ver.outputs.version }}" \
+              --format ipk --out dist-pkg
+
+      - name: Build apk (apk-tools 3, OpenWrt >= 25.12)
+        run: |
+          set -euxo pipefail
+          # Only apk-tools >= 3 can write the ADB-based .apk format. alpine:edge
+          # carries 3.0.x; it is an 8MB image versus a ~300MB OpenWrt SDK.
+          # Runs as root inside the container, so the payload is chowned to 0:0
+          # in a container-local tmpdir rather than on the bind mount.
+          docker run --rm -v "$PWD:/w" -w /w alpine:edge sh -eux -c '
+            apk --version || true
+            packaging/openwrt/build-package.sh \
+              --bin "artifact/daed-linux-${{ matrix.name }}" \
+              --arch "${{ matrix.pkgarch }}" \
+              --version "${{ steps.ver.outputs.version }}" \
+              --format apk --out dist-pkg
+          '
+          # Bind-mounted output is written by the container's root.
+          sudo chown -R "$(id -u):$(id -g)" dist-pkg
+
+      - name: Inspect the packages
+        run: |
+          set -euxo pipefail
+          ls -la dist-pkg
+          IPK=$(ls dist-pkg/*.ipk)
+          # `-f -` is required: GNU tar does not default to stdin the way bsdtar does.
+          tar xzf "$IPK" -O ./control.tar.gz | tar -xzO -f - ./control
+          tar xzf "$IPK" -O ./data.tar.gz | tar -tvz -f -
+          # ipkg-build builds data.tar.gz through a pipeline, so a failing tar
+          # leaves a near-empty archive without failing the script. Assert the
+          # payload really landed instead of shipping a hollow package.
+          tar xzf "$IPK" -O ./data.tar.gz | tar -tz -f - | grep -qx './usr/bin/daed'
+          size=$(stat -c%s "$IPK")
+          echo "ipk size: $size"
+          [ "$size" -gt 1000000 ] || { echo "ipk is implausibly small"; exit 1; }
+          # Round-trip the apk through apk-tools to prove it is well-formed.
+          docker run --rm -v "$PWD:/w" -w /w alpine:edge sh -c \
+            'apk adbdump dist-pkg/*.apk | head -40'
+
+      - name: Upload packages (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: daed-openwrt-${{ matrix.pkgarch }}
+          path: dist-pkg/*
+          if-no-files-found: error
+
+  # Single publisher: three matrix jobs pushing assets to the same release tag
+  # concurrently race each other in the GitHub API, so collect first, then
+  # upload once.
+  publish-packages:
+    name: Publish OpenWrt packages
+    needs: package
+    # Not gated on package.result: if one architecture fails, still publish the
+    # ones that succeeded. Fails loudly only when nothing at all was produced.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect every architecture's packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: daed-openwrt-*
+          path: pkgs
+          merge-multiple: true
+
+      - run: ls -la pkgs
+
+      - name: Publish as Release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: salamander-latest
+          name: daed + salamander (latest)
+          body: Fully-static linux daed with hysteria2 salamander obfuscation (arm64 + armv7 + amd64), plus OpenWrt ipk/apk packages.
+          files: pkgs/*
+          fail_on_unmatched_files: true
+
 # ---------------------------------------------------------------------------
 # Fallback A — if the build fails because some dependency REQUIRES cgo:
 #   reproduce the current binary exactly (CGO=1, statically linked against
