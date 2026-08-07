@@ -33,9 +33,18 @@ Deliberately **not** bundled:
 
 | Go arch | OpenWrt `Architecture` | Device |
 | --- | --- | --- |
-| armv7 | `arm_cortex-a9` | bcm53xx — Phicomm K3 |
+| arm, `GOARM=5` | `arm_cortex-a9` | bcm53xx — Phicomm K3 |
 | arm64 | `aarch64_generic` | 64-bit ARM |
 | amd64 | `x86_64` | 64-bit x86 |
+
+The 32-bit ARM build uses `GOARM=5` — software floating point — on purpose.
+`GOARM=7` makes Go emit VFPv3 instructions, and these boards trap them: a K3
+running ImmortalWrt 25.12.1 reports `Features: half thumb fastmult edsp tls`
+with no `vfp`, so a hardfloat binary dies with `Illegal instruction` on its
+first FP operation. OpenWrt encodes the same fact in its arch names — plain
+`arm_cortex-a9` means no FPU, boards with one use `arm_cortex-a9_vfpv3-d16`.
+Softfloat also runs on boards that do have VFP, and dae does almost no
+floating-point work, so the compatibility is free.
 
 Two installers per architecture, because OpenWrt changed package managers:
 

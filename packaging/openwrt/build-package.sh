@@ -24,7 +24,7 @@ usage() {
 Usage: build-package.sh --root <dir> --name <pkg> --version <ver>
                         --arch <pkgarch> --format ipk|apk --out <dir>
                         [--depends "<a b c>"] [--description <text>]
-                        [--conffiles "</p/a /p/b>"]
+                        [--conffiles "</p/a /p/b>"] [--postinst-pkg <file>]
 
   --root     file tree to package, laid out as it will appear on the device
   --name     package name
@@ -39,6 +39,9 @@ Usage: build-package.sh --root <dir> --name <pkg> --version <ver>
   --format   ipk (opkg, <= 24.10) or apk (apk-tools 3, >= 25.12)
   --out      directory to write the package into
   --section  package section (default: net; LuCI packages use luci)
+  --postinst-pkg  extra shell snippet to run after default_postinst. Needed by
+             LuCI apps, which must invalidate /tmp/luci-indexcache.* and reload
+             rpcd or their menu entry stays hidden until the next reboot.
 
 Environment:
   IPKG_BUILD  path to OpenWrt's scripts/ipkg-build (ipk format only)
@@ -56,6 +59,7 @@ DEPENDS=
 DESCRIPTION=
 CONFFILES=
 SECTION=net
+POSTINST_PKG=
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -69,6 +73,7 @@ while [ $# -gt 0 ]; do
 		--description) DESCRIPTION=${2:-}; shift 2 ;;
 		--conffiles)   CONFFILES=${2:-}; shift 2 ;;
 		--section)     SECTION=${2:?}; shift 2 ;;
+		--postinst-pkg) POSTINST_PKG=${2:?}; shift 2 ;;
 		-h|--help) usage ;;
 		*) echo "build-package.sh: unknown argument: $1" >&2; usage ;;
 	esac
@@ -157,6 +162,11 @@ ipk)
 		chmod 0644 "$TREE/CONTROL/conffiles"
 	fi
 
+	if [ -n "$POSTINST_PKG" ]; then
+		cp "$POSTINST_PKG" "$TREE/CONTROL/postinst-pkg"
+		chmod 0644 "$TREE/CONTROL/postinst-pkg"
+	fi
+
 	cp "$WORK/postinst" "$TREE/CONTROL/postinst"
 	cp "$WORK/prerm" "$TREE/CONTROL/prerm"
 	chmod 0644 "$TREE/CONTROL/control"
@@ -175,6 +185,10 @@ apk)
 	# apk spells architecture-independent "noarch", as package-pack.mk does.
 	APK_ARCH=$ARCH
 	[ "$ARCH" = "all" ] && APK_ARCH=noarch
+
+	if [ -n "$POSTINST_PKG" ]; then
+		sed '/^[[:space:]]*#!/d' "$POSTINST_PKG" >> "$WORK/postinst"
+	fi
 
 	# post-upgrade is a separate hook in apk; opkg reuses postinst for both.
 	{ printf '#!/bin/sh\nexport PKG_UPGRADE=1\n'; sed '/^[[:space:]]*#!/d' "$WORK/postinst"; } > "$WORK/post-upgrade"

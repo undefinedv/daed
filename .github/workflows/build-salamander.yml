@@ -3,10 +3,11 @@ name: Build daed (arm64 / armv7 / amd64 + salamander)
 # Manually-triggered build that produces FULLY-STATIC linux `daed` binaries
 # with hysteria2 salamander obfuscation patched into the outbound dialer.
 #
-# armv7 (GOARCH=arm GOARM=7) targets 32-bit ARM routers such as the Phicomm K3
-# (BCM4709C0, dual Cortex-A9 = ARMv7 with VFPv3). Upstream daed never ships a
-# 32-bit ARM asset, but dae-core does (dae-linux-armv7), and daed is pure Go
-# with CGO off, so the only thing missing was the matrix entry itself.
+# The 32-bit ARM target covers routers such as the Phicomm K3 (BCM4709C0, dual
+# Cortex-A9). Upstream daed never ships a 32-bit ARM asset, but dae-core does
+# (dae-linux-armv7), and daed is pure Go with CGO off, so the only thing missing
+# was the matrix entry itself. Note it builds with GOARM=5, for the reason
+# documented on that entry.
 # The embedded eBPF is unaffected: control/kern is generated for bpfel,bpfeb
 # (endianness, not word size), so the same object serves arm and arm64.
 #
@@ -53,9 +54,23 @@ jobs:
         include:
           - name: arm64
             goarch: arm64
-          - name: armv7 # Phicomm K3 and other Cortex-A8/A9 routers
+          # 32-bit ARM routers, Phicomm K3 among them. GOARM=5 (software
+          # floating point) is deliberate, not a typo: GOARM=7 makes Go emit
+          # VFPv3 instructions, and these boards trap them. Measured on a K3
+          # running ImmortalWrt 25.12.1 / kernel 6.12.94:
+          #   /proc/cpuinfo Features: half thumb fastmult edsp tls
+          # — no vfp, no neon. The Cortex-A9 core has VFPv3-d16 on paper, but
+          # this kernel does not expose it, so every FP instruction is SIGILL.
+          # Confirmed with a minimal Go program on the device: GOARM=7 exits
+          # 132 (128+SIGILL), GOARM=5 runs, and UPX is not implicated either
+          # way. OpenWrt says the same thing through its arch names: plain
+          # arm_cortex-a9 means no FPU, while boards that have one use
+          # arm_cortex-a9_vfpv3-d16. Softfloat also runs on the boards that do
+          # have VFP, and dae does almost no floating-point work, so this
+          # costs nothing and works everywhere.
+          - name: armv7
             goarch: arm
-            goarm: "7"
+            goarm: "5"
           - name: amd64
             goarch: amd64
     env:
@@ -521,10 +536,10 @@ jobs:
 #   install: sudo apt-get install -y musl-tools clang llvm libelf-dev
 #   env:     CC=aarch64-linux-musl-gcc (from the musl.cc cross toolchain)
 #
-# Fallback C — armv7 traps on floating point (SIGILL) on a board whose CPU
-#   lacks VFPv3: rebuild that matrix entry with `goarm: "5"`, which makes Go
-#   emit software floating point. Slower, but runs on any ARMv5+ core.
-#   (Not expected on the K3: its Cortex-A9 has VFPv3-d16.)
+# Fallback C — no longer hypothetical: 32-bit ARM did trap on floating point,
+#   and the matrix now uses goarm: "5" for that reason. See the comment on the
+#   armv7 entry. If a future board turns out to expose VFPv3, goarm: "7" would
+#   be marginally faster, but only on that board.
 #
 # NOTE for 32-bit ARM routers: producing the binary is only half the job — the
 # kernel has to cooperate. Per dae's docs, binding to LAN *or* WAN needs

@@ -39,9 +39,17 @@ LUCI_VERSION=1.4-r1
 
 # Architecture-independent; build-package.sh maps `all` to apk's `noarch`.
 # Depends copied from the reference package's control file.
+#
+# --postinst-pkg is not optional here. Installing the app registers its menu
+# entry, but LuCI hides any entry whose rpcd ACL is not loaded, and rpcd only
+# reads /usr/share/rpcd/acl.d at start. Without this the app is invisible in the
+# web UI until the router reboots — the exact symptom seen on a live install.
+# default_postinst's own `rm -f /tmp/luci-indexcache` does not help either: it
+# predates the hashed /tmp/luci-indexcache.<hash>.json names.
 "$BUILD" --root stage/luci-app --name luci-app-daed --version "$LUCI_VERSION" --arch all \
 	--depends 'libc daed zoneinfo-asia luci-compat luci-lua-runtime' \
 	--description 'LuCI Support for DAED' \
+	--postinst-pkg "$SELF_DIR/files/luci-postinst-pkg" \
 	--section luci --format "$FORMAT" --out "$OUT"
 
 "$BUILD" --root stage/luci-i18n --name luci-i18n-daed-zh-cn --version "$LUCI_VERSION" --arch all \
