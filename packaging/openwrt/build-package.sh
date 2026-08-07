@@ -186,6 +186,33 @@ apk)
 	APK_ARCH=$ARCH
 	[ "$ARCH" = "all" ] && APK_ARCH=noarch
 
+	# OpenWrt's default_postinst locates a package's init scripts and
+	# uci-defaults by reading /lib/apk/packages/<pkg>.list. apk does not
+	# generate that file — official packages carry it in their own payload
+	# (verified: `apk info -L v2ray-geoip` lists lib/apk/packages/v2ray-geoip.list
+	# among its files). Omit it and default_postinst silently does nothing: the
+	# service never gets enabled and uci-defaults never run. opkg has no such
+	# problem because it writes /usr/lib/opkg/info/<pkg>.list itself, so this is
+	# apk-only.
+	#
+	# The list holds absolute paths, one per line, and excludes everything under
+	# /lib/apk/packages — matching the official packages' own lists.
+	mkdir -p "$TREE/lib/apk/packages"
+	( cd "$TREE" && find . \( -type f -o -type l \) ) \
+		| sed 's|^\.||' \
+		| grep -v '^/lib/apk/packages/' \
+		| LC_ALL=C sort > "$TREE/lib/apk/packages/$NAME.list"
+
+	# Read by sysupgrade to carry configuration across firmware upgrades; the
+	# opkg equivalent is CONTROL/conffiles.
+	if [ -n "$CONFFILES" ]; then
+		for cf in $CONFFILES; do echo "$cf"; done \
+			| LC_ALL=C sort > "$TREE/lib/apk/packages/$NAME.conffiles"
+	fi
+
+	chmod 0644 "$TREE/lib/apk/packages/$NAME".* 2>/dev/null || true
+	chown -R 0:0 "$TREE/lib/apk/packages" 2>/dev/null || true
+
 	if [ -n "$POSTINST_PKG" ]; then
 		sed '/^[[:space:]]*#!/d' "$POSTINST_PKG" >> "$WORK/postinst"
 	fi
