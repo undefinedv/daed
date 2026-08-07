@@ -429,17 +429,39 @@ jobs:
       # Flatten before upload: upload-artifact roots a multi-path upload at the
       # least common ancestor, which would bury everything one level deeper and
       # break the publish job's glob.
-      - name: Collect
+      # One artifact per (OpenWrt generation x architecture), so a 25.12 arm64
+      # user downloads ~21MB rather than every arch and both generations.
+      # GitHub always serves artifacts as a .zip — that is the platform, not a
+      # packaging choice — so the point is to make the zip contain exactly one
+      # installer.
+      - name: Upload installer for OpenWrt <= 24.10
+        uses: actions/upload-artifact@v4
+        with:
+          name: daed-openwrt-24.10-${{ matrix.pkgarch }}
+          path: dist-run/24-*.run
+          if-no-files-found: error
+
+      - name: Upload installer for OpenWrt >= 25.12
+        uses: actions/upload-artifact@v4
+        with:
+          name: daed-openwrt-25.12-${{ matrix.pkgarch }}
+          path: dist-run/25-*.run
+          if-no-files-found: error
+
+      # The loose packages, for installing by hand instead of via the .run.
+      # Kept out of the installer artifacts above so they do not double their
+      # size with a second copy of what the .run already contains.
+      - name: Collect the loose packages
         run: |
           set -euxo pipefail
           mkdir -p dist
-          cp dist-ipk/* dist-apk/* dist-run/* dist/
+          cp dist-ipk/* dist-apk/* dist/
           ls -la dist
 
-      - name: Upload packages and installers (artifact)
+      - name: Upload loose packages
         uses: actions/upload-artifact@v4
         with:
-          name: daed-openwrt-${{ matrix.pkgarch }}
+          name: daed-packages-${{ matrix.pkgarch }}
           path: dist/*
           if-no-files-found: error
 
@@ -454,10 +476,21 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
-      - name: Collect every architecture's packages
+      # Both artifact families, in two steps because download-artifact takes a
+      # single pattern and `daed-*` would also drag in the raw binaries the
+      # build job already published. Release assets are downloaded individually,
+      # so publishing everything here costs the user nothing.
+      - name: Collect every architecture's installers
         uses: actions/download-artifact@v4
         with:
           pattern: daed-openwrt-*
+          path: pkgs
+          merge-multiple: true
+
+      - name: Collect every architecture's loose packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: daed-packages-*
           path: pkgs
           merge-multiple: true
 
